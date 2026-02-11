@@ -18,6 +18,7 @@ import calendar
 import datetime
 import time
 import ctypes
+import queue
 from typing import Optional, Dict
 import tempfile
 import os
@@ -34,8 +35,6 @@ try:
     HAS_PYWIN32 = True
 except Exception:
     HAS_PYWIN32 = False
-
-import pystray
 
 from .holidays_provider import HolidaysProvider
 
@@ -139,8 +138,9 @@ class TrayApp:
     def __init__(self, years=None, hover_distance=220, poll_interval=0.12):
         self.years = years or [datetime.datetime.now().year]
         self.holidays_provider = HolidaysProvider(years=self.years)
-        self.icon: Optional[pystray.Icon] = None
+        self.icon: Optional[object] = None
         self.popup: Optional[CalendarPopup] = None
+        self._action_queue: Optional[queue.Queue] = None
         self._running = False
         self.hover_distance = hover_distance
         self.poll_interval = poll_interval
@@ -151,29 +151,51 @@ class TrayApp:
         self.stop()
 
     def _toggle_popup(self, icon=None, item=None):
-        if not self.popup:
-            return
-        # Toggle: if visible -> hide, else show near bottom-right
+        # Always enqueue the toggle action; do not call tkinter from caller thread.
         try:
-            if self.popup.popup.state() == 'normal':
-                self.popup.hide()
+            if not self.popup:
+                return
+
+            def _do_toggle():
+                try:
+                    if self.popup.popup.state() == 'normal':
+                        self.popup.hide()
+                    else:
+                        sx = ctypes.windll.user32.GetSystemMetrics(0)
+                        sy = ctypes.windll.user32.GetSystemMetrics(1)
+                        x = max(10, sx - 300)
+                        y = max(10, sy - 220)
+                        self.popup.show_month(self.popup.current_year or datetime.datetime.now().year,
+                                              self.popup.current_month or datetime.datetime.now().month,
+                                              x, y)
+                except Exception:
+                    pass
+
+            if self._action_queue is not None:
+                self._action_queue.put(_do_toggle)
             else:
-                sx = ctypes.windll.user32.GetSystemMetrics(0)
-                sy = ctypes.windll.user32.GetSystemMetrics(1)
-                # position above taskbar/footer
-                x = max(10, sx - 300)
-                y = max(10, sy - 220)
-                self.popup.show_month(self.popup.current_year or datetime.datetime.now().year,
-                                      self.popup.current_month or datetime.datetime.now().month,
-                                      x, y)
+                try:
+                    if hasattr(self.popup, 'root'):
+                        self.popup.root.after(0, _do_toggle)
+                except Exception:
+                    pass
         except Exception:
-            # fallback: just show for current month
-            now = datetime.datetime.now()
-            sx = ctypes.windll.user32.GetSystemMetrics(0)
-            sy = ctypes.windll.user32.GetSystemMetrics(1)
-            x = max(10, sx - 300)
-            y = max(10, sy - 220)
-            self.popup.show_month(now.year, now.month, x, y)
+            pass
+
+    def _schedule_show(self, year: int, month: int, x: int, y: int):
+        # Put show action into the action queue to be executed on the Tk main thread
+        try:
+            if self._action_queue is not None:
+                self._action_queue.put(lambda: self.popup.show_month(year, month, x, y))
+        except Exception:
+            pass
+
+    def _schedule_hide(self):
+        try:
+            if self._action_queue is not None:
+                self._action_queue.put(lambda: self.popup.hide())
+        except Exception:
+            pass
 
     def start(self):
         # Prepare holidays
@@ -187,6 +209,30 @@ class TrayApp:
         now = datetime.datetime.now()
         self.popup.show_month(now.year, now.month, sx := ctypes.windll.user32.GetSystemMetrics(0) - 300,
                               sy := ctypes.windll.user32.GetSystemMetrics(1) - 220)
+        # create action queue and processor so background threads can enqueue
+        # UI actions safely. The processor runs on the Tk mainloop once
+        # `app.popup.root.mainloop()` is started by the caller.
+        try:
+            self._action_queue = queue.Queue()
+
+            def _process_queue():
+                try:
+                    while not self._action_queue.empty():
+                        action = self._action_queue.get_nowait()
+                        try:
+                            action()
+                        except Exception:
+                            pass
+                    # schedule next poll
+                    self.popup.root.after(80, _process_queue)
+                except Exception:
+                    # if popup.root no longer exists, stop polling
+                    pass
+
+            # start polling loop
+            self.popup.root.after(80, _process_queue)
+        except Exception:
+            self._action_queue = None
 
         # If pywin32 is available, create a native tray icon and catch exact hover events.
         if HAS_PYWIN32:
@@ -202,9 +248,22 @@ class TrayApp:
                 message_map = {}
 
                 WM_TRAY = win32con.WM_USER + 20
-
                 last_move = {"t": 0.0}
                 hide_timeout = 0.6
+                WM_MOUSELEAVE = 0x02A3
+
+                class TRACKMOUSEEVENT(ctypes.Structure):
+                    _fields_ = [("cbSize", ctypes.c_uint), ("dwFlags", ctypes.c_uint), ("hwndTrack", ctypes.c_void_p), ("dwHoverTime", ctypes.c_uint)]
+
+                TME_LEAVE = 0x00000002
+
+                def _track_leave(hwnd):
+                    tme = TRACKMOUSEEVENT()
+                    tme.cbSize = ctypes.sizeof(TRACKMOUSEEVENT)
+                    tme.dwFlags = TME_LEAVE
+                    tme.hwndTrack = hwnd
+                    tme.dwHoverTime = 0
+                    ctypes.windll.user32.TrackMouseEvent(ctypes.byref(tme))
 
                 def _wndproc(hwnd, msg, wparam, lparam):
                     if msg == WM_TRAY:
@@ -215,16 +274,25 @@ class TrayApp:
                                 sx = win32api.GetSystemMetrics(0)
                                 sy = win32api.GetSystemMetrics(1)
                                 if self.popup:
-                                    self.popup.show_month(now.year, now.month, max(10, sx - 300), max(10, sy - 220))
+                                    # schedule show on Tk main thread
+                                    self._schedule_show(now.year, now.month, max(10, sx - 300), max(10, sy - 220))
                                 last_move["t"] = time.time()
+                                _track_leave(hwnd)
                             except Exception:
                                 pass
                         elif lparam in (win32con.WM_LBUTTONDOWN, win32con.WM_RBUTTONDOWN):
                             # toggle on click
                             try:
+                                # schedule toggle on Tk main thread
                                 self._toggle_popup()
                             except Exception:
                                 pass
+                    elif msg == WM_MOUSELEAVE:
+                        try:
+                            if self.popup:
+                                self._schedule_hide()
+                        except Exception:
+                            pass
                     return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
 
                 # Register window class
@@ -240,8 +308,12 @@ class TrayApp:
 
                 nid = (hwnd, 1, win32gui.NIF_ICON | win32gui.NIF_MESSAGE | win32gui.NIF_TIP, WM_TRAY, hicon, "krCalendar")
                 win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, nid)
+                # store handles for cleanup
+                self._hwnd = hwnd
+                self._nid = nid
+                self._class_name = wc.lpszClassName
 
-                # run message pump in a thread
+                # run message pump in a thread (keeps Win32 messages flowing)
                 def pump():
                     while True:
                         msg = win32gui.GetMessage(None, 0, 0)
@@ -252,21 +324,58 @@ class TrayApp:
                 t = threading.Thread(target=pump, daemon=True)
                 t.start()
 
-                # start a watcher to hide popup after no mousemoves for hide_timeout
-                def native_hide_watcher():
-                    while True:
+                # Instead of background threads calling tkinter, use a Tk-based
+                # poll loop running on the main thread to check cursor position
+                # and show/hide the popup. This avoids GIL/main-thread issues.
+                def tk_poll():
+                    try:
+                        if not (self.popup and hasattr(self.popup, 'root') and self.popup.root.winfo_exists()):
+                            return
+                        pt = ctypes.wintypes.POINT()
+                        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+                        x, y = pt.x, pt.y
+                        sx = ctypes.windll.user32.GetSystemMetrics(0)
+                        sy = ctypes.windll.user32.GetSystemMetrics(1)
+                        near = (sx - x) <= self.hover_distance and (sy - y) <= self.hover_distance
+                        # If popup is visible and the cursor is inside the popup window,
+                        # consider that "near" so it doesn't immediately hide when the
+                        # user moves the mouse from the tray icon into the popup.
                         try:
-                            if self.popup and (time.time() - last_move.get("t", 0)) > hide_timeout:
-                                try:
-                                    self.popup.hide()
-                                except Exception:
-                                    pass
+                            if self.popup and self.popup.popup.winfo_ismapped():
+                                px = self.popup.popup.winfo_rootx()
+                                py = self.popup.popup.winfo_rooty()
+                                pw = self.popup.popup.winfo_width()
+                                ph = self.popup.popup.winfo_height()
+                                if (px <= x <= px + pw) and (py <= y <= py + ph):
+                                    near = True
                         except Exception:
                             pass
-                        time.sleep(0.1)
+                        if near:
+                            # show popup
+                            try:
+                                self.popup.show_month(self.popup.current_year or datetime.datetime.now().year,
+                                                      self.popup.current_month or datetime.datetime.now().month,
+                                                      max(10, sx - 300), max(10, sy - 220))
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                self.popup.hide()
+                            except Exception:
+                                pass
+                    finally:
+                        try:
+                            # poll again
+                            if self.popup and hasattr(self.popup, 'root') and self.popup.root.winfo_exists():
+                                self.popup.root.after(int(self.poll_interval * 1000), tk_poll)
+                        except Exception:
+                            pass
 
-                w = threading.Thread(target=native_hide_watcher, daemon=True)
-                w.start()
+                # start Tk poll loop (will run once mainloop starts)
+                try:
+                    self.popup.root.after(int(self.poll_interval * 1000), tk_poll)
+                except Exception:
+                    pass
             except Exception:
                 # fallback to pystray heuristic if anything fails
                 pass
@@ -292,14 +401,14 @@ class TrayApp:
                     near = (sx - x) <= self.hover_distance and (sy - y) <= self.hover_distance
                     try:
                         if near and self.popup:
-                            # show at anchored position
-                            self.popup.show_month(self.popup.current_year or datetime.datetime.now().year,
-                                                  self.popup.current_month or datetime.datetime.now().month,
-                                                  max(10, sx - 300), max(10, sy - 220))
+                            # schedule show at anchored position on main thread
+                            self._schedule_show(self.popup.current_year or datetime.datetime.now().year,
+                                                self.popup.current_month or datetime.datetime.now().month,
+                                                max(10, sx - 300), max(10, sy - 220))
                             was_visible = True
                         else:
                             if self.popup:
-                                self.popup.hide()
+                                self._schedule_hide()
                             was_visible = False
                     except Exception:
                         pass
@@ -308,25 +417,44 @@ class TrayApp:
             self._hover_thread = threading.Thread(target=hover_monitor, daemon=True)
             self._hover_thread.start()
 
-        # Start tray icon
-        image = _create_icon_image()
-        menu = pystray.Menu(
-            pystray.MenuItem('Show Calendar', self._toggle_popup),
-            pystray.MenuItem('Quit', self._quit),
-        )
-        self.icon = pystray.Icon('krcalendar', image, "krCalendar", menu)
-        thread = threading.Thread(target=self.icon.run, daemon=True)
-        thread.start()
+        # (No pystray use) If pywin32 is not available we already started
+        # a hover-monitor in the earlier else branch above.
 
     def stop(self):
         self._running = False
-        if self.icon:
+        if HAS_PYWIN32 and getattr(self, '_hwnd', None):
             try:
-                self.icon.stop()
+                win32gui.Shell_NotifyIcon(win32gui.NIM_DELETE, getattr(self, '_nid'))
+            except Exception:
+                pass
+            try:
+                win32gui.DestroyWindow(getattr(self, '_hwnd'))
+            except Exception:
+                pass
+            try:
+                win32gui.UnregisterClass(getattr(self, '_class_name'), win32api.GetModuleHandle(None))
             except Exception:
                 pass
         if self.popup:
             try:
-                self.popup.destroy()
+                if self._action_queue is not None:
+                    try:
+                        self._action_queue.put(lambda: self.popup.destroy())
+                    except Exception:
+                        try:
+                            self.popup.destroy()
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        if hasattr(self.popup, 'root') and self.popup.root.winfo_exists():
+                            self.popup.root.after(0, lambda: self.popup.destroy())
+                        else:
+                            self.popup.destroy()
+                    except Exception:
+                        try:
+                            self.popup.destroy()
+                        except Exception:
+                            pass
             except Exception:
                 pass

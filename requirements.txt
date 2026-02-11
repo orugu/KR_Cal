@@ -1,4 +1,7 @@
-pystray
+Pillow
+holidays
+requests
+pywin32
 Pillow
 holidays
 requests
