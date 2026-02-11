@@ -239,10 +239,32 @@ class TrayApp:
             # Create temporary .ico file from PIL image
             ico_path = None
             try:
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".ico")
-                ico_path = tmp.name
-                tmp.close()
-                _create_icon_image(64).save(ico_path, format="ICO")
+                # Prefer project image/icon.png if available
+                ico_path = None
+                project_root = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+                candidates = [os.path.join(project_root, 'image', 'icon.png'),
+                              os.path.join(project_root, 'icon.png')]
+                found_png = None
+                for c in candidates:
+                    if os.path.exists(c):
+                        found_png = c
+                        break
+                if found_png:
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.ico')
+                    ico_path = tmp.name
+                    tmp.close()
+                    try:
+                        from PIL import Image
+                        im = Image.open(found_png)
+                        im.save(ico_path, format='ICO')
+                    except Exception:
+                        # fallback to generated icon
+                        _create_icon_image(64).save(ico_path, format='ICO')
+                else:
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".ico")
+                    ico_path = tmp.name
+                    tmp.close()
+                    _create_icon_image(64).save(ico_path, format="ICO")
 
                 # Window class and message loop
                 message_map = {}
@@ -268,7 +290,7 @@ class TrayApp:
                 def _wndproc(hwnd, msg, wparam, lparam):
                     if msg == WM_TRAY:
                         if lparam == win32con.WM_MOUSEMOVE:
-                            # show popup and update last-move timestamp
+                            # user moved mouse over our tray icon: show popup
                             try:
                                 now = datetime.datetime.now()
                                 sx = win32api.GetSystemMetrics(0)
@@ -277,20 +299,21 @@ class TrayApp:
                                     # schedule show on Tk main thread
                                     self._schedule_show(now.year, now.month, max(10, sx - 300), max(10, sy - 220))
                                 last_move["t"] = time.time()
+                                last_move["over_icon"] = True
                                 _track_leave(hwnd)
                             except Exception:
                                 pass
                         elif lparam in (win32con.WM_LBUTTONDOWN, win32con.WM_RBUTTONDOWN):
-                            # toggle on click
+                            # toggle on click (enqueue)
                             try:
-                                # schedule toggle on Tk main thread
                                 self._toggle_popup()
                             except Exception:
                                 pass
                     elif msg == WM_MOUSELEAVE:
+                        # mouse left the icon area; mark time but don't hide immediately
                         try:
-                            if self.popup:
-                                self._schedule_hide()
+                            last_move["t_leave"] = time.time()
+                            last_move["over_icon"] = False
                         except Exception:
                             pass
                     return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
@@ -326,7 +349,9 @@ class TrayApp:
 
                 # Instead of background threads calling tkinter, use a Tk-based
                 # poll loop running on the main thread to check cursor position
-                # and show/hide the popup. This avoids GIL/main-thread issues.
+                # and keep the popup visible while the cursor is inside it or
+                # shortly after hovering the tray icon. Showing the popup is
+                # triggered by native WM_MOUSEMOVE on the tray icon (above).
                 def tk_poll():
                     try:
                         if not (self.popup and hasattr(self.popup, 'root') and self.popup.root.winfo_exists()):
@@ -334,88 +359,46 @@ class TrayApp:
                         pt = ctypes.wintypes.POINT()
                         ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
                         x, y = pt.x, pt.y
-                        sx = ctypes.windll.user32.GetSystemMetrics(0)
-                        sy = ctypes.windll.user32.GetSystemMetrics(1)
-                        near = (sx - x) <= self.hover_distance and (sy - y) <= self.hover_distance
-                        # If popup is visible and the cursor is inside the popup window,
-                        # consider that "near" so it doesn't immediately hide when the
-                        # user moves the mouse from the tray icon into the popup.
+
                         try:
-                            if self.popup and self.popup.popup.winfo_ismapped():
+                            visible = self.popup.popup.winfo_ismapped()
+                        except Exception:
+                            visible = False
+
+                        if visible:
+                            inside_popup = False
+                            try:
                                 px = self.popup.popup.winfo_rootx()
                                 py = self.popup.popup.winfo_rooty()
                                 pw = self.popup.popup.winfo_width()
                                 ph = self.popup.popup.winfo_height()
                                 if (px <= x <= px + pw) and (py <= y <= py + ph):
-                                    near = True
-                        except Exception:
-                            pass
-                        if near:
-                            # show popup
-                            try:
-                                self.popup.show_month(self.popup.current_year or datetime.datetime.now().year,
-                                                      self.popup.current_month or datetime.datetime.now().month,
-                                                      max(10, sx - 300), max(10, sy - 220))
+                                    inside_popup = True
                             except Exception:
-                                pass
-                        else:
-                            try:
-                                self.popup.hide()
-                            except Exception:
-                                pass
+                                inside_popup = False
+
+                            recent_icon = (time.time() - last_move.get("t", 0)) < hide_timeout
+                            if not (inside_popup or recent_icon):
+                                try:
+                                    self.popup.hide()
+                                except Exception:
+                                    pass
+                        # else: do not auto-show from polling; showing occurs from WM_MOUSEMOVE
                     finally:
                         try:
-                            # poll again
                             if self.popup and hasattr(self.popup, 'root') and self.popup.root.winfo_exists():
                                 self.popup.root.after(int(self.poll_interval * 1000), tk_poll)
                         except Exception:
                             pass
 
-                # start Tk poll loop (will run once mainloop starts)
+                # start the Tk poll on the mainloop
                 try:
                     self.popup.root.after(int(self.poll_interval * 1000), tk_poll)
                 except Exception:
                     pass
             except Exception:
-                # fallback to pystray heuristic if anything fails
+                # If any of the pywin32 initialization steps fail, fall back silently
                 pass
-            finally:
-                if ico_path and os.path.exists(ico_path):
-                    try:
-                        os.unlink(ico_path)
-                    except Exception:
-                        pass
-        else:
-            # Start hover monitor (Windows heuristic)
-            def hover_monitor():
-                self._running = True
-                was_visible = True
-                while self._running:
-                    # get cursor
-                    pt = ctypes.wintypes.POINT()
-                    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-                    x, y = pt.x, pt.y
-                    sx = ctypes.windll.user32.GetSystemMetrics(0)
-                    sy = ctypes.windll.user32.GetSystemMetrics(1)
-                    # if cursor is within hover_distance of bottom-right, show
-                    near = (sx - x) <= self.hover_distance and (sy - y) <= self.hover_distance
-                    try:
-                        if near and self.popup:
-                            # schedule show at anchored position on main thread
-                            self._schedule_show(self.popup.current_year or datetime.datetime.now().year,
-                                                self.popup.current_month or datetime.datetime.now().month,
-                                                max(10, sx - 300), max(10, sy - 220))
-                            was_visible = True
-                        else:
-                            if self.popup:
-                                self._schedule_hide()
-                            was_visible = False
-                    except Exception:
-                        pass
-                    time.sleep(self.poll_interval)
-
-            self._hover_thread = threading.Thread(target=hover_monitor, daemon=True)
-            self._hover_thread.start()
 
         # (No pystray use) If pywin32 is not available we already started
         # a hover-monitor in the earlier else branch above.
