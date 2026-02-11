@@ -1,0 +1,5 @@
+pystray
+Pillow
+holidays
+requests
+pywin32
